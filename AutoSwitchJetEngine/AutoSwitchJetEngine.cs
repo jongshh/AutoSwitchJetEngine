@@ -6,80 +6,79 @@ namespace AutoSwitchJetEngine
 {
     public class ModuleAutoSwitchJetEngine : PartModule
     {
-        // Configuration fields
-        [KSPField]
-        public float thresholdOn = 0.66f;  // Throttle > 66% -> Switch to Wet (Afterburner)
+        // 1. [On/Off Switch] Allows toggling this feature per vessel.
+        // isPersistant = true: Saves this setting in the .craft file (Acts as a profile setting).
+        [KSPField(isPersistant = true, guiActive = true, guiActiveEditor = true, guiName = "Auto Afterburner")]
+        [UI_Toggle(disabledText = "Disabled", enabledText = "Enabled")]
+        public bool isAutoSwitchEnabled = true;
 
-        [KSPField]
-        public float thresholdOff = 0.64f; // Throttle < 64% -> Switch to Dry (Normal)
+        // 2. [Slider] Allows the user to manually set the afterburner activation threshold.
+        // Default is 0.66 (66%). This value is also saved per craft.
+        [KSPField(isPersistant = true, guiActive = true, guiActiveEditor = true, guiName = "AB Threshold")]
+        [UI_FloatRange(minValue = 0.0f, maxValue = 1.0f, stepIncrement = 0.01f, scene = UI_Scene.All)]
+        public float thresholdOn = 0.66f;
+
+        // The deactivation threshold is automatically calculated as 2% lower than the activation threshold.
+        // This creates a hysteresis loop to prevent rapid toggling at the boundary.
+        private float thresholdOff => Mathf.Clamp01(thresholdOn - 0.02f);
 
         private MultiModeEngine multiModeEngine;
 
         public override void OnStart(StartState state)
         {
-            // Find the MultiModeEngine module on this part
+            // Retrieve the MultiModeEngine module from the part
             multiModeEngine = this.part.FindModuleImplementing<MultiModeEngine>();
-
-            if (multiModeEngine == null)
-            {
-                // Error handling
-                Debug.LogError("[AutoSwitchJetEngine] Error: MultiModeEngine not found on part " + part.partInfo.title);
-            }
-            else
-            {
-                // Success logging
-                Debug.Log("[AutoSwitchJetEngine] Module loaded successfully on " + part.partInfo.title);
-            }
         }
 
         public override void OnFixedUpdate()
         {
-            // Safety Check
+            // Safety Checks: Ensure the module and vessel exist
             if (multiModeEngine == null || this.vessel == null) return;
 
-            // Get current main throttle (0.0 to 1.0)
+            // [Check 1] If the user disabled the feature, do nothing.
+            if (!isAutoSwitchEnabled) return;
+
+            // Get the current main throttle input (0.0 to 1.0)
             float currentThrottle = this.vessel.ctrlState.mainThrottle;
 
-            // [Condition 1] Activate Afterburner
-            // If throttle > 66% AND currently in Dry (Primary) mode
+            // [Logic 1] Activate Afterburner
+            // Condition: Throttle > User Threshold AND currently in Dry (Primary) mode
             if (currentThrottle > thresholdOn && multiModeEngine.runningPrimary)
             {
-                // Check if engine is actually ignited to avoid log spam
+                // Ensure the engine is actually running to avoid switching when off
                 if (IsEngineIgnited())
                 {
-                    Debug.Log($"[AutoSwitchJetEngine] Activating Afterburner! (Throttle: {currentThrottle:F2})");
-                    multiModeEngine.ToggleMode(); // Switch mode
+                    multiModeEngine.ToggleMode(); // Switch to Wet mode
                 }
             }
-            // [Condition 2] Deactivate Afterburner
-            // If throttle < 64% AND currently in Wet (Secondary) mode
+            // [Logic 2] Deactivate Afterburner
+            // Condition: Throttle < Calculated Off-Threshold AND currently in Wet (Secondary) mode
             else if (currentThrottle < thresholdOff && !multiModeEngine.runningPrimary)
             {
                 if (IsEngineIgnited())
                 {
-                    Debug.Log($"[AutoSwitchJetEngine] Deactivating Afterburner... (Throttle: {currentThrottle:F2})");
-                    multiModeEngine.ToggleMode(); // Switch mode
+                    multiModeEngine.ToggleMode(); // Switch to Dry mode
                 }
             }
         }
 
-        // Helper: Check if the ACTIVE engine is ignited and uses IntakeAir
+        // Helper: Checks if the currently active engine mode is ignited
         private bool IsEngineIgnited()
         {
             var engines = this.part.FindModulesImplementing<ModuleEngines>();
             foreach (var eng in engines)
             {
-                // Check if this engine module matches the current MultiMode state
+                // Check if the engine module matches the current MultiMode state ID
                 if (eng.EngineIgnited && eng.engineID == multiModeEngine.mode)
                 {
-                    // Ensure it consumes IntakeAir (prevents switching RAPIER in Rocket mode)
+                    // Additional Check: Ensure it uses IntakeAir (prevents issues with RAPIER in Rocket mode)
                     return CheckIfUsesIntakeAir(eng);
                 }
             }
             return false;
         }
 
-        // Helper: Verify the engine consumes oxygen (IntakeAir)
+        // Helper: Verifies that the engine consumes IntakeAir (Oxygen)
         private bool CheckIfUsesIntakeAir(ModuleEngines engine)
         {
             if (engine.propellants == null) return false;
