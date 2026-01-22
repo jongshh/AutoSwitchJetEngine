@@ -1,92 +1,222 @@
 ﻿using System;
 using System.Collections.Generic;
-using UnityEngine;
+using System.Linq;
+using UnityEngine; // For Unity base features (GUI, Input, etc.)
+using KSP.IO;      // For File I/O
 
 namespace AutoSwitchJetEngine
 {
+    [KSPAddon(KSPAddon.Startup.Flight, false)]
+    public class AutoSwitchMaster : MonoBehaviour
+    {
+        public static AutoSwitchMaster Instance;
+
+        // GUI Window Variables
+        private Rect _windowRect = new Rect(100, 100, 300, 250);
+        private bool _isGuiVisible = false;
+        private const int WINDOW_ID = 982101;
+
+        // Data Class for Vessel Profiles
+        public class VesselProfile
+        {
+            public bool isEnabled = true;
+            public float threshold = 0.70f; // Default 70%
+        }
+
+        private Dictionary<string, VesselProfile> _profiles = new Dictionary<string, VesselProfile>();
+        private string _configPath;
+
+        private void Awake()
+        {
+            Instance = this;
+            _configPath = KSPUtil.ApplicationRootPath + "GameData/AutoSwitchJetEngine/PluginData/settings.cfg";
+            LoadSettings();
+        }
+
+        private void Update()
+        {
+            // Explicitly use UnityEngine.Input to avoid conflict with KSP.IO.Input
+            if (GameSettings.MODIFIER_KEY.GetKey() && UnityEngine.Input.GetKeyDown(KeyCode.J))
+            {
+                _isGuiVisible = !_isGuiVisible;
+            }
+        }
+
+        private void OnGUI()
+        {
+            if (_isGuiVisible && HighLogic.LoadedSceneIsFlight && FlightGlobals.ActiveVessel != null)
+            {
+                // Explicitly use UnityEngine.GUI
+                _windowRect = UnityEngine.GUI.Window(WINDOW_ID, _windowRect, DrawWindow, "AutoSwitch Jet Engine");
+            }
+        }
+
+        private void DrawWindow(int windowID)
+        {
+            Vessel activeVessel = FlightGlobals.ActiveVessel;
+            if (activeVessel == null) return;
+
+            string vName = activeVessel.vesselName;
+            VesselProfile profile = GetProfile(vName);
+
+            // Explicitly use UnityEngine.GUILayout
+            UnityEngine.GUILayout.BeginVertical();
+
+            UnityEngine.GUILayout.Label($"Vessel: {vName}");
+
+            // Enable/Disable Toggle
+            bool newEnabled = UnityEngine.GUILayout.Toggle(profile.isEnabled, "Auto Switch Enabled");
+            if (newEnabled != profile.isEnabled)
+            {
+                profile.isEnabled = newEnabled;
+            }
+
+            UnityEngine.GUILayout.Space(10);
+            UnityEngine.GUILayout.Label($"Activation Threshold: {profile.threshold:P0}");
+
+            // Threshold Slider
+            float newThreshold = UnityEngine.GUILayout.HorizontalSlider(profile.threshold, 0f, 1f);
+
+            if (Mathf.Abs(newThreshold - profile.threshold) > 0.001f)
+            {
+                profile.threshold = newThreshold;
+            }
+
+            UnityEngine.GUILayout.Space(20);
+
+            // Save Button
+            if (UnityEngine.GUILayout.Button("Save Profile"))
+            {
+                SaveSettings();
+            }
+
+            UnityEngine.GUILayout.EndVertical();
+            UnityEngine.GUI.DragWindow();
+        }
+
+        // --- Helper Methods ---
+
+        public VesselProfile GetProfile(string vesselName)
+        {
+            if (!_profiles.ContainsKey(vesselName))
+            {
+                _profiles[vesselName] = new VesselProfile();
+            }
+            return _profiles[vesselName];
+        }
+
+        private void LoadSettings()
+        {
+            ConfigNode node = ConfigNode.Load(_configPath);
+            if (node == null) return;
+
+            foreach (ConfigNode vesselNode in node.GetNodes("VESSEL_PROFILE"))
+            {
+                string name = vesselNode.GetValue("name");
+                if (string.IsNullOrEmpty(name)) continue;
+
+                VesselProfile p = new VesselProfile();
+                bool.TryParse(vesselNode.GetValue("isEnabled"), out p.isEnabled);
+                float.TryParse(vesselNode.GetValue("threshold"), out p.threshold);
+
+                _profiles[name] = p;
+            }
+        }
+
+        private void SaveSettings()
+        {
+            ConfigNode root = new ConfigNode();
+            foreach (var kvp in _profiles)
+            {
+                ConfigNode vesselNode = new ConfigNode("VESSEL_PROFILE");
+                vesselNode.AddValue("name", kvp.Key);
+                vesselNode.AddValue("isEnabled", kvp.Value.isEnabled);
+                vesselNode.AddValue("threshold", kvp.Value.threshold);
+                root.AddNode(vesselNode);
+            }
+
+            string dir = System.IO.Path.GetDirectoryName(_configPath);
+            if (!System.IO.Directory.Exists(dir)) System.IO.Directory.CreateDirectory(dir);
+
+            root.Save(_configPath);
+        }
+    }
+
     public class ModuleAutoSwitchJetEngine : PartModule
     {
-        // 1. [On/Off Switch] Allows toggling this feature per vessel.
-        // isPersistant = true: Saves this setting in the .craft file (Acts as a profile setting).
-        [KSPField(isPersistant = true, guiActive = true, guiActiveEditor = true, guiName = "Auto Afterburner")]
-        [UI_Toggle(disabledText = "Disabled", enabledText = "Enabled")]
-        public bool isAutoSwitchEnabled = true;
-
-        // 2. [Slider] Allows the user to manually set the afterburner activation threshold.
-        // Default is 0.66 (66%). This value is also saved per craft.
-        [KSPField(isPersistant = true, guiActive = true, guiActiveEditor = true, guiName = "AB Threshold")]
-        [UI_FloatRange(minValue = 0.0f, maxValue = 1.0f, stepIncrement = 0.01f, scene = UI_Scene.All)]
-        public float thresholdOn = 0.66f;
-
-        // The deactivation threshold is automatically calculated as 2% lower than the activation threshold.
-        // This creates a hysteresis loop to prevent rapid toggling at the boundary.
-        private float thresholdOff => Mathf.Clamp01(thresholdOn - 0.02f);
-
-        private MultiModeEngine multiModeEngine;
+        private MultiModeEngine _multiModeEngine;
+        private List<ModuleEngines> _engines;
+        private const float BUFFER = 0.02f; // 2% Buffer zone
 
         public override void OnStart(StartState state)
         {
-            // Retrieve the MultiModeEngine module from the part
-            multiModeEngine = this.part.FindModuleImplementing<MultiModeEngine>();
+            if (!HighLogic.LoadedSceneIsFlight) return;
+
+            _multiModeEngine = part.FindModuleImplementing<MultiModeEngine>();
+            _engines = part.FindModulesImplementing<ModuleEngines>();
         }
 
         public override void OnFixedUpdate()
         {
-            // Safety Checks: Ensure the module and vessel exist
-            if (multiModeEngine == null || this.vessel == null) return;
+            if (!HighLogic.LoadedSceneIsFlight || this.vessel == null) return;
 
-            // [Check 1] If the user disabled the feature, do nothing.
-            if (!isAutoSwitchEnabled) return;
+            // Only run logic if this is the currently active vessel
+            if (this.vessel != FlightGlobals.ActiveVessel) return;
 
-            // Get the current main throttle input (0.0 to 1.0)
+            if (AutoSwitchMaster.Instance == null) return;
+            var profile = AutoSwitchMaster.Instance.GetProfile(this.vessel.vesselName);
+
+            if (!profile.isEnabled) return;
+
+            CheckAndSwitch(profile.threshold);
+        }
+        private void CheckAndSwitch(float threshold)
+        {
+            if (_multiModeEngine == null || _engines == null) return;
+
             float currentThrottle = this.vessel.ctrlState.mainThrottle;
+            string currentModeName = _multiModeEngine.mode;
 
-            // [Logic 1] Activate Afterburner
-            // Condition: Throttle > User Threshold AND currently in Dry (Primary) mode
-            if (currentThrottle > thresholdOn && multiModeEngine.runningPrimary)
+            ModuleEngines activeEngine = _engines.FirstOrDefault(e => e.engineID == currentModeName);
+            if (activeEngine == null) return;
+
+            bool isEngineOn = activeEngine.EngineIgnited || activeEngine.finalThrust > 0.0f;
+
+            if (!isEngineOn) return;
+
+            // Ensure we are using IntakeAir (prevent switching in ClosedCycle/Oxidizer mode)
+            bool isAirBreathing = activeEngine.propellants.Any(p => p.name == "IntakeAir");
+            if (!isAirBreathing) return;
+
+            bool isSecondary = (_multiModeEngine.mode == _multiModeEngine.secondaryEngineID);
+
+            // Logic: Switch based on throttle threshold + buffer
+            if (currentThrottle > (threshold + BUFFER) && !isSecondary)
             {
-                // Ensure the engine is actually running to avoid switching when off
-                if (IsEngineIgnited())
-                {
-                    multiModeEngine.ToggleMode(); // Switch to Wet mode
-                }
+                SwitchMode();
             }
-            // [Logic 2] Deactivate Afterburner
-            // Condition: Throttle < Calculated Off-Threshold AND currently in Wet (Secondary) mode
-            else if (currentThrottle < thresholdOff && !multiModeEngine.runningPrimary)
+            else if (currentThrottle < (threshold - BUFFER) && isSecondary)
             {
-                if (IsEngineIgnited())
-                {
-                    multiModeEngine.ToggleMode(); // Switch to Dry mode
-                }
+                SwitchMode();
             }
         }
 
-        // Helper: Checks if the currently active engine mode is ignited
-        private bool IsEngineIgnited()
+        private void SwitchMode()
         {
-            var engines = this.part.FindModulesImplementing<ModuleEngines>();
-            foreach (var eng in engines)
+            // Iterate through events to find the mode switch event
+            foreach (var eventData in _multiModeEngine.Events)
             {
-                // Check if the engine module matches the current MultiMode state ID
-                if (eng.EngineIgnited && eng.engineID == multiModeEngine.mode)
+                // Event name is case-sensitive and typically 'ModeEvent'
+                if (eventData.name.StartsWith("ModeEvent"))
                 {
-                    // Additional Check: Ensure it uses IntakeAir (prevents issues with RAPIER in Rocket mode)
-                    return CheckIfUsesIntakeAir(eng);
+                    // FIX: Must use BaseEventDetails with Sender.USER for proper event invocation
+                    eventData.Invoke(new BaseEventDetails(BaseEventDetails.Sender.USER));
+                    return;
                 }
             }
-            return false;
-        }
 
-        // Helper: Verifies that the engine consumes IntakeAir (Oxygen)
-        private bool CheckIfUsesIntakeAir(ModuleEngines engine)
-        {
-            if (engine.propellants == null) return false;
-            foreach (Propellant p in engine.propellants)
-            {
-                if (p.name == "IntakeAir") return true;
-            }
-            return false;
+            // Fallback: Manually toggle state if event invocation fails
+            _multiModeEngine.runningPrimary = !_multiModeEngine.runningPrimary;
         }
     }
 }
